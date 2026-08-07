@@ -4,7 +4,7 @@ Thanks for your interest. This project (`ebus-utility-meter-sim`) is a producer-
 
 It is a sibling of [`ebus-panel-sim`](https://github.com/electrification-bus/distribution-enclosure-simulator), which models the distribution enclosure. If you are looking to model a sub-meter or an enclosure's own service-entrance measurements, that is the repo you want; see the table in the README.
 
-**This repository is at scaffold stage.** The packaging, CI and release path are in place; the emitter is not built. [DESIGN.md](DESIGN.md) records the starting point, the specification drift in the vendored reference, and the decisions still open. Read it before proposing anything substantial, because several of those decisions are still genuinely open and worth discussing first.
+**This repository is at scaffold stage.** The packaging, CI and release path are in place; the emitter is not built. [DESIGN.md](DESIGN.md) records the starting point, the specification drift in the vendored reference, the architecture decision already taken (build against `ebus-sdk` directly; do not wait on or copy a shared simulator library), and the decisions still open. Read it before proposing anything substantial.
 
 ## How to contribute
 

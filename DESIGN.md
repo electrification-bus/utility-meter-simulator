@@ -36,11 +36,23 @@ There are no eBus-modelled child devices. Per-phase measurements are property-na
 
 `devices/utility-meter.md` 0.6 contains a contradiction worth filing upstream before building against it. The ASCII device tree in *Utility Meter Device* lists seven capabilities and omits `price`; the prose immediately below it reads "The latter five (`grid`, `doe`, `price`, `demand`, `power-quality`)", which counts `price` in. The prose and the registry agree with each other, so the tree is the likely error, but this repo should not silently pick one.
 
-## Open decisions
+## Decided: how much of `ebus-panel-sim`'s architecture applies
 
-**How much of `ebus-panel-sim`'s architecture applies.** That package separates identity (a manifest, read once at startup) from telemetry (derived per tick from a small driving signal), and resolves the wire surface through vendored spec catalogs, profile JSON and mapping YAML. The split earns its keep there because the tree is large and the device types are many.
+**Copy nothing yet, and do not wait on a shared library.** Build this simulator against `ebus-sdk` directly. Revisit sharing once there is a real emitter here to compare against, which is the first moment two implementations exist rather than one plus a guess.
 
-A utility meter is one device with no children. The manifest/mapping/profile machinery may be more than this needs, or it may be exactly what keeps the two simulators consistent and lets the catalog-drift guard work the same way. Decide deliberately rather than by defaulting to either answer, and record the reasoning here.
+The reasoning, from an analysis of `ebus-panel-sim` run on 2026-08-07 (six independent investigations, each recommendation attacked by two further reviewers on correctness and on cost):
+
+**The wire layer is genuinely device-agnostic, and that is not the constraint.** Its seven modules plus `exceptions.py` and `manifest.py` form a closed subgraph with exactly one panel-domain import, reachable only through `bag_builder.py`. This was proved rather than argued: the closure was copied out, an import hook was installed that raises on any `ebus_panel_sim` import, and a three-phase utility meter was driven through it successfully. A full migration in a scratch checkout came to `164 passed`, `mypy --strict` clean, with zero test-file edits and zero `emitter.py` edits.
+
+That cheapness is the argument for waiting rather than for acting. Moving this code later costs about what it costs now, so there is nothing to buy by moving early, and something real to lose: an API derived from one implementation and validated against that same implementation.
+
+**The highest-value pieces are not simulator-common at all; they belong upstream.** The teardown and transport-ownership correctness (`_sdk_seam.py`) is an `ebus-sdk` gap, filed as [python-sdk#46](https://github.com/electrification-bus/python-sdk/issues/46): `Device` models three teardowns and implements one. The paho test harness in `tests/conftest.py` patches another package's internals, which makes the SDK its honest home. Diff-only publishing is a producer concern the SDK is already partway to owning. For these, the rule of three does not apply, because what that rule prices is the cost of *creating* a shared home, and the home already exists. Waiting for a third simulator to reimplement `$state=lost` incorrectly is not a policy.
+
+**What this repo should therefore do**: depend on `ebus-sdk`, adopt whatever it grows, and write the meter's own wire handling in whatever shape the meter actually needs. If that shape converges on panel-sim's, the later extraction is cheap and will then be justified by two real consumers. If it diverges, nothing was prematurely frozen.
+
+One candidate is worth watching specifically. `profile_loader.py`'s `_expand_pattern` already implements per-phase suffix expansion (`-a`/`-b`/`-c`/`-n`) driven by the spec's own capability catalogs, which is precisely this device's defining shape, and the SDK has no equivalent. In the experiment above, a meter profile that selected `voltage-a` by name alone had `datatype=float, unit=V` hydrated straight from the catalog. If catalog-driven hydration is wanted here, that is the piece to reach for first, and it may justify a shared home before a third consumer exists.
+
+## Still open
 
 **Where the utility's signals come in.** The reference exposes an HTTP endpoint for DOE and price. Whether that belongs in the library, in an example, or in a separate driver is unsettled. It is the one part of this device that is genuinely inbound, and it should not be designed by accident.
 
