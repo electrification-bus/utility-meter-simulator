@@ -1,0 +1,7 @@
+# Authors
+
+Clark Communications Corporation (@dcj): creator and maintainer.
+
+The vendored reference publisher under `examples/utility-meter` originated in the
+`ebus-sdk` examples tree (`electrification-bus/python-sdk`) and carries that
+project's authorship.

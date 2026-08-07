@@ -1,0 +1,862 @@
+#!/usr/bin/env python3
+"""
+utility-meter — eBus utility-meter publisher reference implementation.
+
+Publishes a single eBus utility-meter device
+(`energy.ebus.device.utility-meter`, per `data-models/utility-meter.md`
+in the Electrification Bus specification, v0.3) to an MQTT broker, exposing
+the data model's capabilities: the required `info`, `meter`, and `status`,
+plus the optional `grid`, `doe`, `price`, `demand`, and `power-quality` a
+meter publishes when it has the signal. The `doe` and `price` json properties
+advertise a `$format` JSONSchema (their envelope / price-window array schema),
+and the enum properties advertise their allowed values via `$format`.
+
+Intended for developers building an eBus utility-meter publisher who want
+a runnable starting point. Suitable for running on a Raspberry Pi or any
+Linux host as a stand-in for a real utility meter on a test bench.
+
+The DOE envelopes (`doe/import-limit`, `doe/export-limit`) are two `json`
+properties, each a JSON array of time-windowed envelope objects. They are
+controllable at runtime via a small HTTP endpoint that stands in for the
+utility's out-of-band backhaul:
+
+    POST http://localhost:8765/doe/import-limit
+    Content-Type: application/json
+    [ { "power-limit": 12000, "source": "GRID",
+        "start-time": "2026-07-01T16:00:00Z",
+        "end-time":   "2026-07-01T20:00:00Z" } ]
+
+The body is a single envelope object or an array of them (the retained
+schedule); the whole array is set atomically as one json value. POST an
+empty body (or `null`) to clear the signal for that direction. The same
+endpoint shape is served at `/doe/export-limit` and, for the price schedules,
+at `/price/import-price` and `/price/export-price`. Each posted body is
+validated against the property's `$format` JSONSchema before publish (via
+`homie.validate_json_format`; install `ebus-sdk[validation]` to enable it).
+
+Meter measurements (`meter/active-power`, etc.) are synthesised from a config
+file — this is a publisher reference, not a metrology device.
+
+Usage:
+    ./utility-meter --config /path/to/meter-cfg.json
+
+See `utility-meter-cfg.example.json` for the config schema.
+"""
+
+# This may be removed in Python 3.10+.
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+import threading
+from datetime import datetime, timezone
+from functools import partial
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Dict, Optional
+
+from ebus_sdk import homie
+from ebus_sdk.property import ChangeEvent, GroupedPropertyDict, Property
+
+
+# ─── Defaults ─────────────────────────────────────────────────────────────────
+
+DEFAULT_DOE_ENDPOINT_PORT = 8765
+DEFAULT_BROKER_CFG_ENV = "EBUS_BROKER_CFG"
+
+# eBus utility-meter device type per the data model.
+DEVICE_TYPE = "energy.ebus.device.utility-meter"
+
+# Capability node types (the eBus utility-meter data model, v0.3: three MUST
+# capabilities plus five optional ones a meter publishes when it has the signal).
+CAPABILITY_INFO = "energy.ebus.capability.info"
+CAPABILITY_METER = "energy.ebus.capability.meter"
+CAPABILITY_STATUS = "energy.ebus.capability.status"
+CAPABILITY_GRID = "energy.ebus.capability.grid"
+CAPABILITY_DOE = "energy.ebus.capability.doe"
+CAPABILITY_PRICE = "energy.ebus.capability.price"
+CAPABILITY_DEMAND = "energy.ebus.capability.demand"
+CAPABILITY_POWER_QUALITY = "energy.ebus.capability.power-quality"
+
+# doe capability: two json properties, one per direction. Each holds a JSON
+# array of envelope objects per capabilities/doe.md.
+DOE_DIRECTIONS = ("import-limit", "export-limit")
+
+# price capability: two json properties, one per direction. Each holds a JSON
+# array of price-window objects per capabilities/price.md.
+PRICE_DIRECTIONS = ("import-price", "export-price")
+
+# The $format JSONSchemas advertised on the doe / price json properties (their
+# self-describing envelope / price-window array schemas). Serialized to a string
+# on the property per the Homie 5 json-$format convention; the dict form is
+# reused for publisher-side validation via homie.validate_json_format().
+DOE_LIMIT_FORMAT = {
+    "type": "array",
+    "minItems": 1,
+    "items": {
+        "type": "object",
+        "properties": {
+            "power-limit": {"type": "integer", "minimum": 0},
+            "apparent-power-limit": {"type": "integer", "minimum": 0},
+            "source": {"type": "string", "enum": ["CONTRACT", "REGULATOR", "EQUIPMENT", "GRID", "UNKNOWN"]},
+            "start-time": {"type": "string", "format": "date-time"},
+            "end-time": {"type": "string", "format": "date-time"},
+        },
+        "anyOf": [{"required": ["power-limit"]}, {"required": ["apparent-power-limit"]}],
+    },
+}
+PRICE_FORMAT = {
+    "type": "array",
+    "minItems": 1,
+    "items": {
+        "type": "object",
+        "properties": {
+            "price": {"type": "number"},
+            "currency": {"type": "string"},
+            "price-level": {
+                "type": "string",
+                "enum": ["SUPER_OFF_PEAK", "OFF_PEAK", "MID_PEAK", "ON_PEAK", "CRITICAL_PEAK", "UNKNOWN"],
+            },
+            "source": {"type": "string", "enum": ["SCHEDULED", "MARKET", "EVENT", "UNKNOWN"]},
+            "start-time": {"type": "string", "format": "date-time"},
+            "end-time": {"type": "string", "format": "date-time"},
+        },
+        "dependentRequired": {"price": ["currency"]},
+        "anyOf": [{"required": ["price"]}, {"required": ["price-level"]}],
+    },
+}
+DOE_LIMIT_FORMAT_STR = json.dumps(DOE_LIMIT_FORMAT)
+PRICE_FORMAT_STR = json.dumps(PRICE_FORMAT)
+
+
+# ─── Logger boilerplate ───────────────────────────────────────────────────────
+
+
+def _make_logger(name: str, level: int = logging.INFO) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+        logger.addHandler(handler)
+    return logger
+
+
+# ─── Pure model: utility-meter state ──────────────────────────────────────────
+
+
+class UtilityMeter:
+    """
+    Pure-Python model of the utility meter's published state.
+
+    Holds the values for `info`, `meter`, `status`, and `doe` properties.
+    Knows nothing about MQTT — the adapter below translates this state to
+    Homie/eBus topics.
+
+    Values change via `set_doe_*` methods (driven by the HTTP DOE endpoint)
+    and via `tick()` (driven by a periodic thread that simulates meter
+    measurement updates). Subscribers register callbacks via
+    `add_property_on_change_callback`.
+    """
+
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        logger: Optional[logging.Logger] = None,
+    ):
+        self._logger = logger or _make_logger(self.__class__.__name__)
+        self._config = config
+        self._props = GroupedPropertyDict()
+        self._populate_info()
+        self._populate_meter()
+        self._populate_status()
+        self._populate_scalars("grid")
+        self._populate_scalars("demand")
+        self._populate_scalars("power-quality")
+        self._populate_doe()
+        self._populate_price()
+
+    # ── info ──
+
+    def _populate_info(self):
+        """Static nameplate properties from config."""
+        info = self._config.get("info", {})
+        # TODO: validate that the standard `info` properties from the
+        # eBus utility-meter data model are populated (vendor-name, model,
+        # serial-number, meter-form, meter-class, phases, neutral-connected,
+        # nominal-frequency, nominal-phase-angle, nominal-voltage-*).
+        for key, value in info.items():
+            self._props.add_property_from_dict("info", {"id": key, "type": type(value), "value": value})
+
+    # ── meter ──
+
+    def _populate_meter(self):
+        """Synthesised instantaneous + cumulative measurements."""
+        # TODO: drive these from a synthetic-load model rather than static
+        # config so the demo is more illustrative. For scaffold purposes,
+        # config-supplied values are sufficient.
+        meter = self._config.get("meter", {})
+        for key, value in meter.items():
+            self._props.add_property_from_dict("meter", {"id": key, "type": type(value), "value": value})
+
+    # ── status ──
+
+    def _populate_status(self):
+        defaults = {
+            "communication-state": "OK",
+            "time-sync-state": "LOCKED",
+        }
+        defaults.update(self._config.get("status", {}))
+        for key, value in defaults.items():
+            self._props.add_property_from_dict("status", {"id": key, "type": type(value), "value": value})
+
+    # ── grid / demand / power-quality (scalar measurement capabilities) ──
+
+    def _populate_scalars(self, group: str):
+        """Seed a scalar-measurement capability's properties from config.
+
+        Optional utility-meter capabilities (`grid`, `demand`, `power-quality`)
+        that a meter publishes only when it senses them. The example seeds
+        representative values from config; a real meter would drive these from
+        its measurement hardware. Datatype/unit/`$format` come from
+        `HOMIE_PROPERTY_HINTS`; the published set is whatever config supplies.
+        """
+        for key, value in self._config.get(group, {}).items():
+            self._props.add_property_from_dict(group, {"id": key, "type": type(value), "value": value})
+
+    # ── doe ──
+
+    def _populate_doe(self):
+        """
+        Initial DOE envelopes from config. May be empty / absent — DOE is
+        publish-on-change and a meter that signals no envelope simply omits
+        the property. Config supplies `doe.import-limit` / `doe.export-limit`
+        as JSON arrays of envelope objects; each becomes one `json` property.
+        """
+        doe = self._config.get("doe", {})
+        for direction in DOE_DIRECTIONS:
+            envelopes = doe.get(direction)
+            if envelopes:
+                self._props.add_property_from_dict(
+                    "doe",
+                    {"id": direction, "type": "json", "value": list(envelopes)},
+                )
+
+    def set_doe_import_limit(self, envelopes):
+        """Set the import-side DOE schedule atomically. See `_set_json_schedule`."""
+        self._set_json_schedule("doe", "import-limit", envelopes)
+
+    def set_doe_export_limit(self, envelopes):
+        """Set the export-side DOE schedule atomically. See `_set_json_schedule`."""
+        self._set_json_schedule("doe", "export-limit", envelopes)
+
+    def _set_or_clear(self, group, prop_id, value, py_type):
+        try:
+            existing = self._props.get(group, prop_id)
+        except KeyError:
+            existing = None
+        if existing is None:
+            if value is not None:
+                self._props.add_property_from_dict(group, {"id": prop_id, "type": py_type, "value": value})
+        else:
+            existing.set_value(value)
+
+    # ── price ──
+
+    def _populate_price(self):
+        """Initial price schedules from config (`price.import-price` /
+        `price.export-price`), each a JSON array of price-window objects. Like
+        `doe`, publish-on-change: a direction with no signal simply omits the
+        property. See `capabilities/price.md`."""
+        price = self._config.get("price", {})
+        for direction in PRICE_DIRECTIONS:
+            windows = price.get(direction)
+            if windows:
+                self._props.add_property_from_dict("price", {"id": direction, "type": "json", "value": list(windows)})
+
+    def set_import_price(self, windows):
+        """Set the import-price schedule atomically. See `_set_json_schedule`."""
+        self._set_json_schedule("price", "import-price", windows)
+
+    def set_export_price(self, windows):
+        """Set the export-price schedule atomically. See `_set_json_schedule`."""
+        self._set_json_schedule("price", "export-price", windows)
+
+    def _set_json_schedule(self, group: str, prop_id: str, items):
+        """Set one json-array schedule property (doe envelope / price window)
+        atomically. `items` is a single object, a list of them, or None to
+        clear. Shared by the doe and price runtime-update paths."""
+        if items is None:
+            value = None
+        elif isinstance(items, dict):
+            value = [items]
+        else:
+            value = list(items)
+        self._set_or_clear(group, prop_id, value, "json")
+
+    # ── tick (periodic synthetic update) ──
+
+    def tick(self):
+        """
+        Called periodically to nudge meter measurements so consumers can see
+        live changes. Scaffold: TODO — implement synthetic load model.
+        """
+        # TODO: synthesise plausible variation on active-power / voltage /
+        # current; advance imported-energy / exported-energy counters.
+        pass
+
+    # ── callback registration ──
+
+    def add_property_on_change_callback(self, group, prop_id, callback):
+        return self._props.add_property_on_change_callback(group, prop_id, callback)
+
+    def get_property(self, group, prop_id) -> Property:
+        return self._props.get(group, prop_id)
+
+    def as_dict(self) -> dict:
+        return self._props.as_dict()
+
+
+# ─── Adapter: model → Homie/eBus topics ───────────────────────────────────────
+
+
+def _set_homie_property_from_property(homie_property: homie.Property, prop: Property) -> bool:
+    """Callback used to mirror UtilityMeter property values onto Homie."""
+    return homie_property.set_value(prop.value())
+
+
+# Capability → property-id → {datatype, unit} hint table.
+# Mirrors the standard property vocabulary from the eBus utility-meter
+# data model. The scaffold publishes a representative subset; the actual
+# published set adapts to which UtilityMeter properties are populated
+# from config.
+HOMIE_PROPERTY_HINTS: Dict[str, Dict[str, Dict[str, Any]]] = {
+    "info": {
+        "vendor-name": {"datatype": homie.PropertyDatatype.STRING},
+        "model": {"datatype": homie.PropertyDatatype.STRING},
+        "serial-number": {"datatype": homie.PropertyDatatype.STRING},
+        "firmware-version": {"datatype": homie.PropertyDatatype.STRING},
+        "data-model-version": {"datatype": homie.PropertyDatatype.STRING},
+        "meter-form": {"datatype": homie.PropertyDatatype.STRING},
+        "meter-class": {"datatype": homie.PropertyDatatype.STRING},
+        "phases": {"datatype": homie.PropertyDatatype.INTEGER},
+        "neutral-connected": {"datatype": homie.PropertyDatatype.BOOLEAN},
+        "nominal-frequency": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.HERTZ},
+        "nominal-phase-angle": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.DEGREE},
+        "nominal-voltage-line-to-line": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.VOLTS},
+        "nominal-voltage-line-to-neutral": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.VOLTS},
+        "calculation-convention": {"datatype": homie.PropertyDatatype.ENUM, "format": "ARITHMETIC,VECTORIAL"},
+        "ct-ratio": {"datatype": homie.PropertyDatatype.FLOAT},
+        "pt-ratio": {"datatype": homie.PropertyDatatype.FLOAT},
+        "register-multiplier": {"datatype": homie.PropertyDatatype.FLOAT},
+    },
+    "meter": {
+        "active-power": {
+            "datatype": homie.PropertyDatatype.FLOAT,
+            "unit": homie.Unit.WATT,
+        },
+        "frequency": {
+            "datatype": homie.PropertyDatatype.FLOAT,
+            "unit": homie.Unit.HERTZ,
+        },
+        "imported-energy": {
+            "datatype": homie.PropertyDatatype.FLOAT,
+            "unit": homie.Unit.WATT_HOUR,
+        },
+        "exported-energy": {
+            "datatype": homie.PropertyDatatype.FLOAT,
+            "unit": homie.Unit.WATT_HOUR,
+        },
+        "voltage-a": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.VOLTS},
+        "voltage-b": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.VOLTS},
+        "voltage-c": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.VOLTS},
+        "current-a": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.AMPERE},
+        "current-b": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.AMPERE},
+        "current-c": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.AMPERE},
+        # A utility meter MAY publish the full per-phase + derived matrix
+        # (reactive/apparent power, power-factor, per-phase energy); this scaffold
+        # publishes a representative subset. See capabilities/meter.md.
+    },
+    "status": {
+        "communication-state": {"datatype": homie.PropertyDatatype.ENUM, "format": "OK,DEGRADED,LOST,UNKNOWN"},
+        "time-sync-state": {"datatype": homie.PropertyDatatype.ENUM, "format": "LOCKED,UNLOCKED,NONE,UNKNOWN"},
+        "tamper-state": {"datatype": homie.PropertyDatatype.ENUM, "format": "NORMAL,TAMPER_DETECTED,UNKNOWN"},
+        "reverse-energy-flag": {"datatype": homie.PropertyDatatype.BOOLEAN},
+        "internal-temperature": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.DEGREE_CELSIUS},
+    },
+    "grid": {
+        "grid-state": {"datatype": homie.PropertyDatatype.ENUM, "format": "UP,DOWN,DEGRADED,UNKNOWN"},
+        "last-outage-time": {"datatype": homie.PropertyDatatype.DATETIME},
+        "last-restoration-time": {"datatype": homie.PropertyDatatype.DATETIME},
+    },
+    "doe": {
+        # Two json properties, one per direction; each value is a JSON array of
+        # time-windowed envelope objects, constrained by the $format JSONSchema.
+        # Publish-only (no /set); driven at runtime by the HTTP endpoint.
+        "import-limit": {"datatype": homie.PropertyDatatype.JSON, "format": DOE_LIMIT_FORMAT_STR},
+        "export-limit": {"datatype": homie.PropertyDatatype.JSON, "format": DOE_LIMIT_FORMAT_STR},
+    },
+    "price": {
+        # Two json properties, one per direction; each a JSON array of
+        # time-windowed price-window objects, constrained by the $format schema.
+        "import-price": {"datatype": homie.PropertyDatatype.JSON, "format": PRICE_FORMAT_STR},
+        "export-price": {"datatype": homie.PropertyDatatype.JSON, "format": PRICE_FORMAT_STR},
+    },
+    "demand": {
+        "integration-window": {"datatype": homie.PropertyDatatype.INTEGER, "unit": homie.Unit.SECONDS},
+        "current-interval-demand": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.WATT},
+        "previous-interval-demand": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.WATT},
+        "peak-demand-this-period": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.WATT},
+        "peak-demand-time": {"datatype": homie.PropertyDatatype.DATETIME},
+        "peak-demand-reset-time": {"datatype": homie.PropertyDatatype.DATETIME},
+    },
+    "power-quality": {
+        "thd-voltage-a": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.PERCENT},
+        "thd-voltage-b": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.PERCENT},
+        "thd-voltage-c": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.PERCENT},
+        "thd-current-a": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.PERCENT},
+        "thd-current-b": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.PERCENT},
+        "thd-current-c": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.PERCENT},
+        "tdd-current-a": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.PERCENT},
+        "tdd-current-b": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.PERCENT},
+        "tdd-current-c": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.PERCENT},
+        "voltage-unbalance": {"datatype": homie.PropertyDatatype.FLOAT, "unit": homie.Unit.PERCENT},
+    },
+}
+
+
+class UtilityMeterAdapter:
+    """
+    Translates a UtilityMeter to a Homie 5 device on the eBus broker.
+
+    Creates one root device of type `energy.ebus.device.utility-meter` with
+    four capability nodes (`info`, `meter`, `status`, `doe`). Each Homie
+    property is mirrored from the corresponding UtilityMeter property via a
+    callback.
+    """
+
+    def __init__(
+        self,
+        meter: UtilityMeter,
+        device_id: str,
+        device_name: str,
+        mqtt_cfg: Dict[str, Any],
+        logger: Optional[logging.Logger] = None,
+    ):
+        self._logger = logger or _make_logger(self.__class__.__name__)
+        self._meter = meter
+        self._device_id = device_id
+        self._device_name = device_name
+        self._mqtt_cfg = mqtt_cfg
+        self._homie_device: Optional[homie.Device] = None
+        self._create_device_and_nodes()
+
+    @staticmethod
+    def load_broker_config(config_file: str) -> Dict[str, Any]:
+        with open(config_file, "r") as fp:
+            return json.load(fp)
+
+    # ── homie device + nodes ──
+
+    def _create_homie_device(self) -> homie.Device:
+        device = homie.Device(
+            self._device_id,
+            name=self._device_name,
+            type=DEVICE_TYPE,
+            mqtt_cfg=self._mqtt_cfg,
+        )
+        device.start_mqtt_client()
+        return device
+
+    def _add_capability_node(
+        self,
+        node_id: str,
+        node_type: str,
+        node_name: str,
+        meter_group: str,
+    ) -> homie.Node:
+        node = self._homie_device.add_node_from_dict({"id": node_id, "name": node_name, "type": node_type})
+        self._homie_nodes[meter_group] = node
+        if not self._meter._props.has_group(meter_group):
+            # Empty capability node — properties may be added at runtime
+            # (e.g. doe values arriving via the HTTP endpoint). The
+            # PROPERTY_ADDED observer registered below will mirror them
+            # to Homie when they arrive.
+            return node
+        for prop_id, prop in self._meter._props.items(meter_group):
+            self._add_homie_property(node, meter_group, prop_id, prop)
+        return node
+
+    def _add_homie_property(
+        self,
+        node: homie.Node,
+        meter_group: str,
+        prop_id: str,
+        prop: Property,
+    ):
+        """
+        Add a single Homie property to `node`, mirroring the meter
+        Property `prop`, and wire a change callback so subsequent
+        set_value() calls on the meter property republish to Homie.
+        Used both at startup (for properties seeded from config) and at
+        runtime (for properties added by the PROPERTY_ADDED observer).
+        """
+        if prop_id in self._homie_property_ids.get(meter_group, set()):
+            return  # already mirrored
+        hint = HOMIE_PROPERTY_HINTS.get(meter_group, {}).get(prop_id, {})
+        property_dict = {"id": prop_id, "value": prop.value()}
+        if "datatype" in hint:
+            property_dict["datatype"] = hint["datatype"]
+        else:
+            inferred = homie.datatype_from_type(prop.type())
+            if inferred:
+                property_dict["datatype"] = inferred
+        if "unit" in hint:
+            property_dict["unit"] = hint["unit"]
+        if "format" in hint:
+            # $format: a JSONSchema (json properties) or an enum value list.
+            property_dict["format"] = hint["format"]
+        homie_property = node.add_property_from_dict(property_dict)
+        self._meter.add_property_on_change_callback(
+            meter_group,
+            prop_id,
+            partial(_set_homie_property_from_property, homie_property),
+        )
+        self._homie_property_ids.setdefault(meter_group, set()).add(prop_id)
+
+    def _on_meter_property_event(
+        self,
+        event_type: ChangeEvent,
+        group_name: str = None,
+        property_id: str = None,
+        property: Property = None,
+        **kwargs,
+    ):
+        """
+        Observer callback for the meter's GroupedPropertyDict. Mirrors
+        runtime-added properties (e.g. doe values arriving via HTTP after
+        startup) to Homie.
+        """
+        if event_type != ChangeEvent.PROPERTY_ADDED:
+            return
+        node = self._homie_nodes.get(group_name)
+        if node is None:
+            self._logger.warning(
+                "reason=runtimePropertyAddUnknownGroup,group=%s,propertyId=%s",
+                group_name,
+                property_id,
+            )
+            return
+        self._add_homie_property(node, group_name, property_id, property)
+
+    def _create_device_and_nodes(self):
+        self._homie_device = self._create_homie_device()
+        self._homie_nodes: Dict[str, homie.Node] = {}
+        self._homie_property_ids: Dict[str, set] = {}
+        self._add_capability_node("info", CAPABILITY_INFO, "Meter identity", "info")
+        self._add_capability_node(
+            "meter",
+            CAPABILITY_METER,
+            "Electrical measurements",
+            "meter",
+        )
+        self._add_capability_node("status", CAPABILITY_STATUS, "Meter operational state", "status")
+        self._add_capability_node("grid", CAPABILITY_GRID, "Utility supply health", "grid")
+        self._add_capability_node("doe", CAPABILITY_DOE, "Utility-signalled operating envelope", "doe")
+        self._add_capability_node("price", CAPABILITY_PRICE, "Utility-signalled dynamic price", "price")
+        self._add_capability_node("demand", CAPABILITY_DEMAND, "Peak-average demand", "demand")
+        self._add_capability_node(
+            "power-quality", CAPABILITY_POWER_QUALITY, "Power-quality measurements", "power-quality"
+        )
+        # Observe runtime property additions so values arriving after
+        # device startup (typical for doe via the HTTP endpoint) are
+        # mirrored onto Homie.
+        self._meter._props.add_observer(
+            self._on_meter_property_event,
+            event_types=[ChangeEvent.PROPERTY_ADDED],
+        )
+
+
+# ─── DOE HTTP endpoint ────────────────────────────────────────────────────────
+
+
+# Map POST path to (UtilityMeter setter method, the property's $format schema).
+# Both doe and price are json-array schedules driven out of band; here the HTTP
+# endpoint stands in for the utility backhaul.
+_SCHEDULE_PATHS = {
+    "/doe/import-limit": ("set_doe_import_limit", DOE_LIMIT_FORMAT),
+    "/doe/export-limit": ("set_doe_export_limit", DOE_LIMIT_FORMAT),
+    "/price/import-price": ("set_import_price", PRICE_FORMAT),
+    "/price/export-price": ("set_export_price", PRICE_FORMAT),
+}
+
+
+def _normalize_and_validate(body: Any, schema: dict) -> Optional[list]:
+    """Normalize a posted json body into a schedule array and validate it.
+
+    Accepts None (clear the signal), a single object, or an array of objects; a
+    lone object is wrapped in a one-element array. The normalized array is
+    validated against the property's `$format` JSONSchema with the SDK's
+    `homie.validate_json_format` (the same schema the property advertises), which
+    is a graceful no-op when the optional `jsonschema` package is not installed.
+    Raises ValueError on a malformed or schema-invalid body.
+    """
+    if body is None:
+        return None
+    items = [body] if isinstance(body, dict) else body
+    if not isinstance(items, list):
+        raise ValueError("body must be an object, an array, or null")
+    error = homie.validate_json_format(items, schema)
+    if error is not None:
+        raise ValueError(error)
+    return items
+
+
+class _DoeRequestHandler(BaseHTTPRequestHandler):
+    """Tiny HTTP handler accepting DOE updates as JSON."""
+
+    meter: UtilityMeter = None  # type: ignore[assignment]
+
+    def log_message(self, format, *args):
+        logging.getLogger("DoeEndpoint").info(
+            "%s - - [%s] %s",
+            self.address_string(),
+            self.log_date_time_string(),
+            format % args,
+        )
+
+    def do_POST(self):
+        entry = _SCHEDULE_PATHS.get(self.path)
+        if entry is None:
+            self._reply(HTTPStatus.NOT_FOUND, {"error": "unknown path", "known": sorted(_SCHEDULE_PATHS)})
+            return
+        setter_name, schema = entry
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length).decode("utf-8") if length else ""
+        try:
+            # An empty body clears the signal for this direction (same as null).
+            body = json.loads(raw) if raw.strip() else None
+        except Exception as exc:
+            self._reply(HTTPStatus.BAD_REQUEST, {"error": f"invalid json: {exc}"})
+            return
+        try:
+            items = _normalize_and_validate(body, schema)
+        except ValueError as exc:
+            self._reply(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        try:
+            getattr(self.meter, setter_name)(items)
+        except Exception as exc:
+            self._reply(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            return
+        self._reply(
+            HTTPStatus.OK,
+            {"applied": {"path": self.path, "items": items, "at": datetime.now(timezone.utc).isoformat()}},
+        )
+
+    def _reply(self, status: HTTPStatus, payload: dict):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def start_doe_endpoint(meter: UtilityMeter, port: int) -> ThreadingHTTPServer:
+    handler = type("BoundDoeRequestHandler", (_DoeRequestHandler,), {"meter": meter})
+    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logging.getLogger("ScheduleEndpoint").info(
+        "reason=scheduleEndpointReady,port=%d,paths=%s", port, ",".join(sorted(_SCHEDULE_PATHS))
+    )
+    return server
+
+
+# ─── Periodic tick ────────────────────────────────────────────────────────────
+
+
+def start_tick_thread(meter: UtilityMeter, interval_s: float) -> threading.Event:
+    stop = threading.Event()
+
+    def _run():
+        while not stop.is_set():
+            try:
+                meter.tick()
+            except Exception:
+                logging.exception("reason=tickException")
+            stop.wait(interval_s)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return stop
+
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
+
+def _discover_broker(timeout: float, log: logging.Logger) -> Optional[tuple]:
+    """Discover an eBus broker over mDNS (`_secure-mqtt._tcp`).
+
+    Returns (host, port) from the advertisement, preferring the spec `broker`
+    TXT record (the `<host>.local` name the broker's cert SAN covers) and
+    falling back to the SRV target. Returns None on timeout. Requires the
+    optional `mdns` extra (zeroconf).
+    """
+    try:
+        from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
+    except ImportError:
+        log.error("discovery needs the 'mdns' extra: pip install 'ebus-sdk[mdns]'")
+        return None
+
+    service_type = "_secure-mqtt._tcp.local."
+    found = threading.Event()
+    result: Dict[str, Any] = {}
+
+    class _Listener(ServiceListener):
+        def add_service(self, zc, type_, name):
+            info = zc.get_service_info(type_, name, timeout=3000)
+            if info is None:
+                return
+            broker = info.properties.get(b"broker")
+            result["host"] = broker.decode() if broker else info.server.rstrip(".")
+            result["port"] = info.port or 8883
+            found.set()
+
+        def update_service(self, zc, type_, name):
+            self.add_service(zc, type_, name)
+
+        def remove_service(self, zc, type_, name):
+            pass
+
+    zc = Zeroconf()
+    ServiceBrowser(zc, service_type, _Listener())
+    try:
+        if found.wait(timeout):
+            return result["host"], result["port"]
+        return None
+    finally:
+        zc.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=("eBus utility-meter publisher reference implementation."))
+    parser.add_argument(
+        "-c",
+        "--config",
+        required=True,
+        help="Path to the meter config JSON file (see utility-meter-cfg.example.json).",
+    )
+    parser.add_argument(
+        "-b",
+        "--broker-config",
+        help=f"Path to the MQTT broker config JSON file. Defaults to ${DEFAULT_BROKER_CFG_ENV} env var.",
+    )
+    parser.add_argument(
+        "--discover",
+        action="store_true",
+        help="Discover the broker over mDNS (_secure-mqtt._tcp) and use the "
+        "advertised host/port, overriding 'host'/'port' in the broker config. "
+        "The broker config still supplies the TLS material.",
+    )
+    parser.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=8.0,
+        help="Seconds to wait for mDNS broker discovery (default: 8.0).",
+    )
+    parser.add_argument(
+        "--doe-port",
+        type=int,
+        default=DEFAULT_DOE_ENDPOINT_PORT,
+        help=f"Port for the local DOE HTTP endpoint (default: {DEFAULT_DOE_ENDPOINT_PORT}).",
+    )
+    parser.add_argument(
+        "--tick-interval",
+        type=float,
+        default=5.0,
+        help="Synthetic-update interval seconds (default: 5.0).",
+    )
+    args = parser.parse_args()
+
+    # Logging
+    logging.basicConfig()
+    log = _make_logger("utility-meter")
+
+    # Meter config
+    with open(args.config, "r") as fp:
+        meter_cfg = json.load(fp)
+
+    # Broker config
+    broker_cfg_path = args.broker_config or os.environ.get(DEFAULT_BROKER_CFG_ENV)
+    if not broker_cfg_path:
+        log.error(
+            "no broker config; pass --broker-config or set %s",
+            DEFAULT_BROKER_CFG_ENV,
+        )
+        sys.exit(2)
+    mqtt_cfg = UtilityMeterAdapter.load_broker_config(broker_cfg_path)
+
+    # Prefer an mDNS-discovered broker over the config's explicit host, per the
+    # eBus broker-discovery flow. The broker config still supplies the TLS
+    # material; discovery only fills in where to connect.
+    if args.discover:
+        endpoint = _discover_broker(args.discover_timeout, log)
+        if endpoint is not None:
+            mqtt_cfg["host"], mqtt_cfg["port"] = endpoint
+            log.info(
+                "reason=brokerDiscovered,host=%s,port=%d",
+                mqtt_cfg["host"],
+                mqtt_cfg["port"],
+            )
+        elif mqtt_cfg.get("host"):
+            log.warning(
+                "reason=brokerDiscoveryTimeout,fallbackHost=%s",
+                mqtt_cfg["host"],
+            )
+        else:
+            log.error("broker discovery failed and no fallback 'host' in broker config")
+            sys.exit(2)
+
+    # Resolve device identity from config
+    device_id = meter_cfg.get("device-id") or meter_cfg.get("info", {}).get("serial-number")
+    device_name = meter_cfg.get("device-name", "Utility Meter")
+    if not device_id:
+        log.error("no device-id (and no info.serial-number) in meter config")
+        sys.exit(2)
+
+    # Wire it up. Constructing the adapter creates the Homie device, its
+    # capability nodes, and starts the MQTT client (side effects we rely on);
+    # nothing else references it, so we don't bind the instance.
+    meter = UtilityMeter(meter_cfg, logger=_make_logger("UtilityMeter"))
+    UtilityMeterAdapter(
+        meter,
+        device_id=device_id,
+        device_name=device_name,
+        mqtt_cfg=mqtt_cfg,
+        logger=_make_logger("UtilityMeterAdapter"),
+    )
+    start_doe_endpoint(meter, args.doe_port)
+    start_tick_thread(meter, args.tick_interval)
+
+    log.info(
+        "reason=utilityMeterReady,deviceId=%s,deviceType=%s",
+        device_id,
+        DEVICE_TYPE,
+    )
+
+    # Wait forever for an event that will never come
+    threading.Event().wait()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception as e:
+        logging.exception(e)
+        sys.exit(1)

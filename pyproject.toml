@@ -1,0 +1,98 @@
+[build-system]
+# PEP 639 floor: `license = "MIT"` as an SPDX expression plus `license-files` needs
+# hatchling >= 1.27. Below it the build SUCCEEDS and quietly emits the legacy
+# metadata instead (measured on 1.26.3: `License: MIT`, no `License-Expression`,
+# no `License-File`), so an unpinned backend would degrade the published metadata
+# without failing anything.
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ebus-utility-meter-sim"
+# Single source of truth: src/ebus_utility_meter_sim/__init__.py's __version__ (read
+# dynamically below). Bump it in ONE place; publish.yml fails the release if the
+# git tag disagrees. Matches the convention across the eBus family.
+dynamic = ["version"]
+description = "Producer-side Homie publisher and simulator for the eBus utility-meter device"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    {name = "Clark Communications Corporation"},
+]
+keywords = ["homie", "homie5", "mqtt", "iot", "ebus", "simulator", "utility-meter", "metering", "energy"]
+# `requires-python` is what pip enforces; these are what PyPI indexes and what the
+# README's Python badge reads. Kept in step with the floor above, not with the CI
+# matrix, which tests the ends of the range (3.11 and 3.14) rather than every point
+# in it.
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Home Automation",
+    "Topic :: System :: Emulators",
+    # The package ships py.typed; this is how PyPI surfaces that, on the page and
+    # in the "Typed" search filter.
+    "Typing :: Typed",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "ebus-sdk>=0.19,<0.20",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.15.0",
+    "mypy>=1.10",
+]
+
+[project.urls]
+Homepage = "https://ebus.energy"
+Repository = "https://github.com/electrification-bus/utility-meter-simulator"
+Issues = "https://github.com/electrification-bus/utility-meter-simulator/issues"
+
+[tool.hatch.version]
+path = "src/ebus_utility_meter_sim/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+# `packages` carries everything under the package directory, data files included.
+# Do NOT add a `force-include` table naming a tree that is already inside the
+# package: hatchling treats a second file at the same archive path as fatal, and
+# ebus-panel-sim shipped four releases with a wheel that could never build because
+# of exactly that. publish.yml asserts the built artifact for the same reason.
+packages = ["src/ebus_utility_meter_sim"]
+
+# The sdist excludes the agent/issue-tracker symlinks into the shadow repo. They are
+# untracked, so a clean checkout has none, but a local build would otherwise fail on
+# their absolute link targets.
+[tool.hatch.build.targets.sdist]
+exclude = [".claude", ".beads", "CLAUDE.local.md", "AGENTS.md"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 99
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "TCH", "RUF"]
+# TC001/TC002/TC003 (move imports into TYPE_CHECKING blocks) conflicts with mypy's
+# preference for runtime-resolvable imports. We rely on `from __future__ import
+# annotations` which makes runtime cost a non-issue, so leave imports at module top.
+ignore = ["TC001", "TC002", "TC003"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+# No `ebus_sdk` override: the SDK has shipped a `py.typed` marker since 0.13.0, so
+# mypy resolves its real types. An `ignore_missing_imports` override here would be
+# inert against the current pin, and the stale premise behind one is what would
+# justify annotating an SDK seam as `Any` rather than reaching for the type the SDK
+# actually publishes.

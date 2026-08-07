@@ -1,0 +1,24 @@
+{
+  "$schema": "https://ebus.energy/schemas/ebus-spec.json",
+  "spec_repo": "https://github.com/electrification-bus/specification",
+  "synced_commit": "4254526b0a8c11cab0d40fd700b1fc295c0479c6",
+  "synced_date": "2026-08-05",
+  "role": "publisher",
+  "framework": "0.7",
+  "implements": {
+    "capabilities": {
+      "info": "0.2",
+      "meter": "0.2",
+      "status": "0.1",
+      "grid": "0.1",
+      "doe": "0.1",
+      "price": "0.1",
+      "demand": "0.1",
+      "power-quality": "0.1"
+    },
+    "devices": {
+      "utility-meter": "0.6"
+    }
+  },
+  "notes": "role=publisher: ebus-utility-meter-sim publishes a single energy.ebus.device.utility-meter device (no eBus-modelled children; per-phase measurements are property-name suffixes -a/-b/-c/-n). info, meter and status are always present; grid, doe, price, demand and power-quality are published when the meter has the corresponding signal. SCAFFOLD: these pins record what the device model DECLARES, not yet what this package publishes -- the emitter is not built. The vendored reference at examples/utility-meter targets data model 0.3 against a document that has since moved to devices/utility-meter.md and reached 0.6, so it must not be read as evidence of conformance. Tighten these pins to what is actually published, and add a catalog-drift guard in the shape of ebus-panel-sim's tests/test_catalog_drift.py, as the emitter lands. Known upstream inconsistency at 0.6: the ASCII device tree omits `price` while the prose beneath it counts price among the optional five, and the device-type registry agrees with the prose; file upstream before building against the tree."
+}

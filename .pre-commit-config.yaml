@@ -1,0 +1,31 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.12
+    hooks:
+      - id: ruff-check
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # Run mypy through the project venv rather than a pre-commit-managed one. The
+  # isolated env would need `ebus-sdk` restated in `additional_dependencies`, and
+  # a copy of the pin that nothing keeps in sync silently drifts from pyproject.
+  # Typing the ebus-sdk seam correctly depends on resolving the SDK's real types
+  # (it has shipped `py.typed` since 0.13.0), so this hook now runs exactly what
+  # CI runs, against exactly the pinned SDK. It also checks `src`, not just
+  # `src/ebus_utility_meter_sim`, matching CI.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy --strict (project venv)
+        language: system
+        types: [python]
+        pass_filenames: false
+        entry: uv run mypy --strict src tests
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
